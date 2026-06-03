@@ -47,10 +47,48 @@ def _text_after(text, label_pattern):
     return m.group(1).strip() if m else None
 
 
+def _extract_cooling_medium(text):
+    """
+    Извлекает информацию о Cooling medium из текста Modine PDF.
+    Правила:
+    - Если "Water" -> "Water"
+    - Если "Propylene Glycol" с процентом -> "Propylene Glycol / 40%"
+    - Другие комбинации -> соединяет через " / "
+    """
+    # Ищем секцию Cooling medium
+    cooling_section = re.search(r"Cooling medium(.+?)(?:Dimensions|Max operation)", text, re.DOTALL | re.IGNORECASE)
+    if not cooling_section:
+        return "Water"  # По умолчанию
+
+    section_text = cooling_section.group(1)
+
+    # Ищем основной тип охладителя
+    water_match = re.search(r"\bWater\b", section_text, re.IGNORECASE)
+    propylene_match = re.search(r"Propylene\s+Glycol", section_text, re.IGNORECASE)
+
+    # Ищем процент (например "40%")
+    percentage_match = re.search(r"(\d+)\s*%", section_text)
+    percentage = percentage_match.group(1) if percentage_match else None
+
+    # Применяем правила
+    if water_match and not propylene_match:
+        # Только Water
+        return "Water"
+    elif propylene_match:
+        # Propylene Glycol, возможно с процентом
+        if percentage:
+            return f"Propylene Glycol / {percentage}%"
+        else:
+            return "Propylene Glycol"
+    else:
+        return "Water"  # По умолчанию
+
+
 def extract_parameters(text):
     params = {}
 
     params["capacity"] = _value_after(text, r"Air.*Capacity") or 0
+    params["cooling_medium"] = _extract_cooling_medium(text)
 
     air_section = re.search(r"Air(.+?)Cooling medium", text, re.DOTALL | re.IGNORECASE)
     if air_section:
@@ -80,6 +118,8 @@ def extract_parameters(text):
     params["max_op_temp"]      = _value_after(text, r"Max\s+op\.?\s+temperature") or 0
     params["abs_pressure"]     = _value_after(text, r"Absolute\s+pressure") or 1013
     params["connection"]       = _text_after(text, r"Connection\s+size") or "TOBE-FILLED"
+    params["ordering_code"]    = _text_after(text, r"Ordering\s+code") or "TOBE-FILLED"
+    params["fin_material"]     = _text_after(text, r"Fin\s+material") or "TOBE-FILLED"
 
     print(f"  Capacity [kW]:             {params['capacity']}")
     print(f"  Air flow [m³/s]:           {params['air_flow']}")
@@ -92,6 +132,9 @@ def extract_parameters(text):
     print(f"  Max op. temperature [°C]:  {params['max_op_temp']}")
     print(f"  Absolute pressure [hPa]:   {params['abs_pressure']}")
     print(f"  Connection:                {params['connection']}")
+    print(f"  Ordering code:             {params['ordering_code']}")
+    print(f"  Cooling medium:            {params['cooling_medium']}")
+    print(f"  Fin material:              {params['fin_material']}")
     return params
 
 
@@ -122,16 +165,38 @@ def _spec_table_data(values):
     temp_text    = f"≤ 13 K (≤ {int(max_air_temp)}°C at {int(water_in)}°C water in)"
     ped_text     = "PED, Pressure Equipment Directive 97/23/EC"
 
+    # Определяем тип охладителя по Ordering code
+    ordering_code = values.get("ordering_code", "")
+    is_double_tube = "QDKR" in ordering_code.upper()
+    is_single_tube = "QLKE" in ordering_code.upper()
+
+    # Определяем значения на основе типа
+    if is_double_tube:
+        cooler_type = "Double tube"
+        secondary_material = "Copper"
+        secondary_plate = "Naval brass (CuZn38Sn1)"
+    elif is_single_tube:
+        cooler_type = "Single tube"
+        secondary_material = ""
+        secondary_plate = ""
+    else:
+        cooler_type = "Double tube"  # По умолчанию
+        secondary_material = "Copper"
+        secondary_plate = "Naval brass (CuZn38Sn1)"
+
+    # Используем извлеченное значение cooling_medium
+    cooling_medium = values.get("cooling_medium", "Water")
+
     return [
         ["Parameter",                                                      "Value"],
-        ["Water cooler type",                                              "Double tube"],
-        ["Cooling medium",                                                 "Water"],
+        ["Water cooler type",                                              cooler_type],
+        ["Cooling medium",                                                 cooling_medium],
         ["",                                                               ""],
         ["Primary tube material (inner)",                                  "Copper-Nickel 90/10"],
-        ["Secondary tube material (outer)",                                "Copper"],
-        ["Fin material",                                                   "Copper"],
+        ["Secondary tube material (outer)",                                secondary_material],
+        ["Fin material",                                                   values.get("fin_material", "TOBE-FILLED")],
         ["Tube plate material (primary)",                                  "Naval brass (CuZn38Sn1)"],
-        ["Tube plate (secondary)",                                         "Naval brass (CuZn38Sn1)"],
+        ["Tube plate (secondary)",                                         secondary_plate],
         ["Header, removable",                                              "Rilsan coated steel"],
         ["Casing material",                                                "Galvanized steel"],
         ["Connection",                                                     values["connection"]],
@@ -151,6 +216,7 @@ def _spec_table_data(values):
         ["Minimum tube thickness [mm]",                                    "Manufacturer default"],
         ["Corrosion allowance in header boxes [mm]",                       "1.5"],
         ["Max operation temperature [°C]",                            _fmt(values["max_op_temp"])],
+        ["Other requirements",                                         ""],
     ]
 
 
@@ -215,9 +281,9 @@ def append_drawing_page(asia_pdf_path, modine_pdf_path):
     #   • Right-side block:        material specs (Flange, Fin pitch … Max Op.temp)
     #   • Bottom-left label:       "Design code version g = 1 / QDKR - PRELIMINARY"
     white_areas = [
-        (0,   PAGE_HEIGHT - 62, PAGE_WIDTH, PAGE_HEIGHT),  # logo + date
-        (365, 147,               PAGE_WIDTH, 302),          # material specs block
-        (150, 132,               310,        167),          # design code label
+        (0,   PAGE_HEIGHT - 72, PAGE_WIDTH, PAGE_HEIGHT),  # logo + date
+        (365, 127,               PAGE_WIDTH, 302),          # material specs block
+        (0, 	0,		PAGE_WIDTH, 162),		# design code label
     ]
 
     overlay   = PdfReader(_white_overlay(white_areas))
@@ -246,7 +312,7 @@ def find_modine_files(directory="."):
 
 
 def project_id_from_filename(path):
-    m = re.search(r"(\d{4}[A-Z]{2})", os.path.basename(path))
+    m = re.search(r"(\d{4}[A-Z]{2}\d{3})", os.path.basename(path))
     return m.group(1) if m else "TOBE-FILLED"
 
 
